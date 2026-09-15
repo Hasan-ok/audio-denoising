@@ -1,4 +1,5 @@
 import gradio as gr
+import spaces
 import librosa
 import numpy as np
 import soundfile as sf
@@ -56,6 +57,7 @@ print("Best model loaded successfully.")
 # Denoising function
 # --------------------------------------------------
 
+@spaces.GPU
 def denoise_audio(audio_path):
 
     if audio_path is None:
