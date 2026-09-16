@@ -1,6 +1,6 @@
 data/
 .venv/
-**pycache**/
+__pycache__/
 *.pyc
 outputs/
 checkpoints/latest.pth
