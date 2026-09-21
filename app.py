@@ -188,6 +188,10 @@ def denoise_audio(audio_path):
             )
 
             noisy_magnitude = np.abs(noisy_stft)
+
+            # Log compression
+            noisy_magnitude = np.log1p(noisy_magnitude)
+
             noisy_phase = np.angle(noisy_stft)
 
             # ------------------------------------------------
@@ -214,12 +218,15 @@ def denoise_audio(audio_path):
                 predicted_magnitude = model(
                     noisy_tensor
                 )
-
             predicted_magnitude = (
                 predicted_magnitude
                 .squeeze()
                 .cpu()
                 .numpy()
+            )
+            # Convert log magnitude back to normal magnitude
+            predicted_magnitude = np.expm1(
+                predicted_magnitude
             )
 
             # ------------------------------------------------

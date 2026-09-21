@@ -39,22 +39,34 @@ checkpoint_dir.mkdir(exist_ok=True)
 
 
 # --------------------------------------------------
-# Dataset
+# Datasets
 # --------------------------------------------------
 
-dataset = AudioDenoisingDataset(
+# Training dataset:
+# Random 1-second crops are used so the model sees
+# different parts of each recording.
+train_full_dataset = AudioDenoisingDataset(
     clean_dir=clean_dir,
-    noisy_dir=noisy_dir
+    noisy_dir=noisy_dir,
+    random_crop=True
 )
 
-print("Full dataset:", len(dataset))
+# Validation dataset:
+# Center crops are used so validation is deterministic.
+validation_full_dataset = AudioDenoisingDataset(
+    clean_dir=clean_dir,
+    noisy_dir=noisy_dir,
+    random_crop=False
+)
+
+print("Full dataset:", len(train_full_dataset))
 
 
 # --------------------------------------------------
-# Train / Validation split
+# Train / validation split
 # --------------------------------------------------
 
-dataset_size = len(dataset)
+dataset_size = len(train_full_dataset)
 
 validation_size = int(0.10 * dataset_size)
 training_size = dataset_size - validation_size
@@ -69,13 +81,14 @@ indices = torch.randperm(
 train_indices = indices[:training_size]
 validation_indices = indices[training_size:]
 
+
 train_dataset = Subset(
-    dataset,
+    train_full_dataset,
     train_indices
 )
 
 validation_dataset = Subset(
-    dataset,
+    validation_full_dataset,
     validation_indices
 )
 
@@ -92,7 +105,8 @@ train_loader = DataLoader(
     batch_size=8,
     shuffle=True,
     num_workers=4,
-    pin_memory=True
+    pin_memory=True,
+    persistent_workers=True
 )
 
 validation_loader = DataLoader(
@@ -100,7 +114,8 @@ validation_loader = DataLoader(
     batch_size=8,
     shuffle=False,
     num_workers=4,
-    pin_memory=True
+    pin_memory=True,
+    persistent_workers=True
 )
 
 
@@ -112,12 +127,40 @@ model = UNet().to(device)
 
 print("Model created.")
 
+total_parameters = sum(
+    parameter.numel()
+    for parameter in model.parameters()
+)
+
+print("Model parameters:", f"{total_parameters:,}")
+
 
 # --------------------------------------------------
-# Loss and optimizer
+# Loss
 # --------------------------------------------------
 
-criterion = nn.MSELoss()
+mse_loss = nn.MSELoss()
+l1_loss = nn.L1Loss()
+
+
+def combined_loss(prediction, target):
+
+    mse = mse_loss(
+        prediction,
+        target
+    )
+
+    l1 = l1_loss(
+        prediction,
+        target
+    )
+
+    return 0.8 * mse + 0.2 * l1
+
+
+# --------------------------------------------------
+# Optimizer
+# --------------------------------------------------
 
 optimizer = torch.optim.Adam(
     model.parameters(),
@@ -126,12 +169,40 @@ optimizer = torch.optim.Adam(
 
 
 # --------------------------------------------------
+# Learning-rate scheduler
+# --------------------------------------------------
+
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode="min",
+    factor=0.5,
+    patience=2,
+    min_lr=1e-6
+)
+
+
+# --------------------------------------------------
+# Mixed precision
+# --------------------------------------------------
+
+use_amp = torch.cuda.is_available()
+
+if use_amp:
+    scaler = torch.amp.GradScaler("cuda")
+else:
+    scaler = None
+
+
+# --------------------------------------------------
 # Training settings
 # --------------------------------------------------
 
-epochs = 20
+epochs = 30
 
 best_validation_loss = float("inf")
+
+early_stopping_patience = 5
+epochs_without_improvement = 0
 
 
 # --------------------------------------------------
@@ -145,15 +216,17 @@ for epoch in range(epochs):
         f"========== Epoch {epoch + 1}/{epochs} =========="
     )
 
-    # ------------------------------
+    # --------------------------------------------------
     # Training
-    # ------------------------------
+    # --------------------------------------------------
 
     model.train()
 
     training_loss = 0.0
 
-    for batch_number, (noisy, clean) in enumerate(train_loader):
+    for batch_number, (noisy, clean) in enumerate(
+        train_loader
+    ):
 
         noisy = noisy.to(
             device,
@@ -165,22 +238,58 @@ for epoch in range(epochs):
             non_blocking=True
         )
 
-        prediction = model(noisy)
-
-        loss = criterion(
-            prediction,
-            clean
+        optimizer.zero_grad(
+            set_to_none=True
         )
 
-        optimizer.zero_grad()
+        if use_amp:
 
-        loss.backward()
+            with torch.amp.autocast(
+                device_type="cuda"
+            ):
 
-        optimizer.step()
+                prediction = model(noisy)
+
+                loss = combined_loss(
+                    prediction,
+                    clean
+                )
+
+            scaler.scale(loss).backward()
+
+            scaler.unscale_(optimizer)
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=1.0
+            )
+
+            scaler.step(optimizer)
+
+            scaler.update()
+
+        else:
+
+            prediction = model(noisy)
+
+            loss = combined_loss(
+                prediction,
+                clean
+            )
+
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=1.0
+            )
+
+            optimizer.step()
 
         training_loss += loss.item()
 
         if (batch_number + 1) % 100 == 0:
+
             print(
                 f"Batch {batch_number + 1}/{len(train_loader)} "
                 f"- Loss: {loss.item():.6f}"
@@ -189,9 +298,9 @@ for epoch in range(epochs):
     training_loss /= len(train_loader)
 
 
-    # ------------------------------
+    # --------------------------------------------------
     # Validation
-    # ------------------------------
+    # --------------------------------------------------
 
     model.eval()
 
@@ -211,21 +320,47 @@ for epoch in range(epochs):
                 non_blocking=True
             )
 
-            prediction = model(noisy)
+            if use_amp:
 
-            loss = criterion(
-                prediction,
-                clean
-            )
+                with torch.amp.autocast(
+                    device_type="cuda"
+                ):
+
+                    prediction = model(noisy)
+
+                    loss = combined_loss(
+                        prediction,
+                        clean
+                    )
+
+            else:
+
+                prediction = model(noisy)
+
+                loss = combined_loss(
+                    prediction,
+                    clean
+                )
 
             validation_loss += loss.item()
 
     validation_loss /= len(validation_loader)
 
 
-    # ------------------------------
+    # --------------------------------------------------
+    # Learning-rate update
+    # --------------------------------------------------
+
+    scheduler.step(
+        validation_loss
+    )
+
+    current_lr = optimizer.param_groups[0]["lr"]
+
+
+    # --------------------------------------------------
     # Print results
-    # ------------------------------
+    # --------------------------------------------------
 
     print(
         f"Training Loss:   {training_loss:.6f}"
@@ -235,53 +370,97 @@ for epoch in range(epochs):
         f"Validation Loss: {validation_loss:.6f}"
     )
 
+    print(
+        f"Learning Rate:   {current_lr:.8f}"
+    )
 
-    # ------------------------------
+
+    # --------------------------------------------------
     # Save latest checkpoint
-    # ------------------------------
+    # --------------------------------------------------
 
-    latest_checkpoint = checkpoint_dir / "latest.pth"
+    latest_checkpoint = (
+        checkpoint_dir / "latest.pth"
+    )
 
     torch.save(
         {
             "epoch": epoch + 1,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
             "training_loss": training_loss,
-            "validation_loss": validation_loss
+            "validation_loss": validation_loss,
+            "learning_rate": current_lr
         },
         latest_checkpoint
     )
 
 
-    # ------------------------------
+    # --------------------------------------------------
     # Save best checkpoint
-    # ------------------------------
+    # --------------------------------------------------
 
     if validation_loss < best_validation_loss:
 
         best_validation_loss = validation_loss
 
-        best_checkpoint = checkpoint_dir / "best_model.pth"
+        epochs_without_improvement = 0
+
+        best_checkpoint = (
+            checkpoint_dir / "best_model.pth"
+        )
 
         torch.save(
             {
                 "epoch": epoch + 1,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "training_loss": training_loss,
-                "validation_loss": validation_loss
+                "validation_loss": validation_loss,
+                "learning_rate": current_lr
             },
             best_checkpoint
         )
 
+        print("✓ Best model saved.")
+
+    else:
+
+        epochs_without_improvement += 1
+
         print(
-            "✓ Best model saved."
+            f"No improvement for "
+            f"{epochs_without_improvement} epoch(s)."
         )
 
 
+    # --------------------------------------------------
+    # Early stopping
+    # --------------------------------------------------
+
+    if (
+        epochs_without_improvement
+        >= early_stopping_patience
+    ):
+
+        print()
+        print(
+            "Early stopping triggered."
+        )
+
+        break
+
+
+# --------------------------------------------------
+# Finished
+# --------------------------------------------------
+
 print()
 print("Training complete.")
+
 print(
-    f"Best validation loss: {best_validation_loss:.6f}"
+    f"Best validation loss: "
+    f"{best_validation_loss:.6f}"
 )
