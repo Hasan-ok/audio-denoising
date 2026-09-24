@@ -87,6 +87,68 @@ def get_audio_info(audio_path):
         return "Audio information unavailable."
 
 
+def _noise_floor_db(audio):
+    """
+    Rough estimate of the background noise floor: RMS energy of the
+    quietest 10% of short frames, expressed in dB.
+    """
+
+    frame_length = 2048
+    hop_length = 512
+
+    rms = librosa.feature.rms(
+        y=audio,
+        frame_length=frame_length,
+        hop_length=hop_length
+    )[0]
+
+    if len(rms) == 0:
+        return None
+
+    quietest_count = max(1, int(len(rms) * 0.1))
+
+    quietest_rms = np.sort(rms)[:quietest_count]
+
+    floor = np.mean(quietest_rms)
+
+    if floor <= 1e-8:
+        return None
+
+    return 20 * np.log10(floor)
+
+
+def get_result_info(noisy_path, denoised_path):
+
+    if denoised_path is None:
+        return "Your enhanced audio will appear here after processing."
+
+    try:
+        noisy, sr_noisy = librosa.load(noisy_path, sr=None, mono=True)
+        denoised, sr_denoised = librosa.load(denoised_path, sr=None, mono=True)
+
+        noisy_floor = _noise_floor_db(noisy)
+        denoised_floor = _noise_floor_db(denoised)
+
+        if noisy_floor is not None and denoised_floor is not None:
+
+            reduction_db = noisy_floor - denoised_floor
+
+            if reduction_db > 0.5:
+                reduction_text = f"Background noise reduced by ~{reduction_db:.1f} dB."
+            else:
+                reduction_text = "Background noise was already low in this recording."
+
+        else:
+            reduction_text = "Denoising complete."
+
+        return (
+            f"✅ **{reduction_text}** &nbsp; • &nbsp; "
+        )
+
+    except Exception:
+        return "✅ Denoising complete."
+
+
 # ============================================================
 # Denoising
 # ============================================================
@@ -190,7 +252,9 @@ def denoise_audio(audio_path):
             noisy_magnitude = np.abs(noisy_stft)
 
             # Log compression
-            noisy_magnitude = np.log1p(noisy_magnitude)
+            noisy_magnitude = np.log1p(
+                noisy_magnitude
+            )
 
             noisy_phase = np.angle(noisy_stft)
 
@@ -218,12 +282,14 @@ def denoise_audio(audio_path):
                 predicted_magnitude = model(
                     noisy_tensor
                 )
+
             predicted_magnitude = (
                 predicted_magnitude
                 .squeeze()
                 .cpu()
                 .numpy()
             )
+
             # Convert log magnitude back to normal magnitude
             predicted_magnitude = np.expm1(
                 predicted_magnitude
@@ -327,15 +393,26 @@ custom_css = """
 --------------------------------------------------------- */
 
 .gradio-container {
-    max-width: 1100px !important;
+    max-width: 1400px !important;
     margin: auto !important;
-    padding: 25px !important;
+    padding: 20px !important;
 }
 
 
 /* ---------------------------------------------------------
    Background
 --------------------------------------------------------- */
+
+:root {
+    --body-background-fill: #dfe4ee !important;
+    --background-fill-primary: #dfe4ee !important;
+}
+
+html,
+body,
+#root {
+    background-color: #dfe4ee !important;
+}
 
 body {
     background:
@@ -348,7 +425,12 @@ body {
             circle at 90% 0%,
             rgba(139, 92, 246, 0.08),
             transparent 30%
-        ) !important;
+        ),
+        #dfe4ee !important;
+}
+
+.gradio-container {
+    background: transparent !important;
 }
 
 
@@ -358,16 +440,16 @@ body {
 
 .hero {
     text-align: center;
-    padding: 55px 20px 40px 20px;
+    padding: 25px 20px 20px 20px;
 }
 
 .hero-badge {
     display: inline-block;
-    padding: 7px 15px;
+    padding: 5px 15px;
     border-radius: 999px;
     background: rgba(99, 102, 241, 0.12);
     color: #6366f1;
-    font-size: 12px;
+    font-size: 30px;
     font-weight: 700;
     letter-spacing: 0.7px;
     margin-bottom: 18px;
@@ -383,9 +465,10 @@ body {
 .hero p {
     font-size: 18px;
     color: #6b7280;
-    max-width: 650px;
+    max-width: none;
     margin: auto;
     line-height: 1.6;
+    white-space: nowrap;
 }
 
 
@@ -396,10 +479,27 @@ body {
 .card {
     border: 1px solid rgba(128, 128, 128, 0.16) !important;
     border-radius: 22px !important;
-    padding: 28px !important;
+    padding: 18px !important;
     background: rgba(255, 255, 255, 0.72) !important;
     box-shadow:
         0 12px 40px rgba(0, 0, 0, 0.055) !important;
+}
+
+/* Force top alignment inside cards so the two panels line up
+   even when one has more content than the other. Without this,
+   equal_height on the Row stretches the shorter column but lets
+   its content drift toward the center instead of staying pinned
+   to the top. */
+
+.card {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    justify-content: flex-start !important;
+}
+
+.card > * {
+    flex-grow: 0 !important;
 }
 
 
@@ -427,6 +527,21 @@ body {
 
 .upload-area {
     border-radius: 18px !important;
+}
+
+
+/* ---------------------------------------------------------
+   Audio boxes — let both stretch equally to fill their
+   column, so whichever side is naturally shorter in a given
+   state (empty dropzone vs. loaded player, empty result vs.
+   filled result) always matches the other's height, keeping
+   the text boxes beneath them aligned in every state.
+--------------------------------------------------------- */
+
+.upload-area,
+#result-audio {
+    flex-grow: 1 !important;
+    min-height: 260px;
 }
 
 
@@ -562,6 +677,7 @@ body {
 
     .hero p {
         font-size: 16px;
+        white-space: normal;
     }
 
     .card {
@@ -596,12 +712,8 @@ with gr.Blocks(
         <div class="hero">
 
             <div class="hero-badge">
-                🎧 AI AUDIO ENHANCEMENT
+                🎧 AudioClean AI
             </div>
-
-            <h1>
-                AudioClean AI
-            </h1>
 
             <p>
                 Remove unwanted background noise and
@@ -614,36 +726,75 @@ with gr.Blocks(
 
 
     # ========================================================
-    # STEP 1 — UPLOAD
+    # STEP 1 — UPLOAD + STEP 3 — RESULT
     # ========================================================
 
-    with gr.Column(elem_classes="card"):
+    with gr.Row(equal_height=True):
 
-        gr.HTML(
-            """
-            <div class="section-title">
-                <span style="color:#6366f1;">01</span>
-                &nbsp; Upload your audio
-            </div>
+        # ----------------------------------------------------
+        # LEFT CARD — UPLOAD
+        # ----------------------------------------------------
 
-            <div class="section-description">
-                Drop a noisy recording below or choose
-                a file from your device.
-            </div>
-            """
-        )
+        with gr.Column(elem_classes="card"):
 
-        noisy_audio = gr.Audio(
-            label="",
-            type="filepath",
-            sources=["upload"],
-            elem_classes="upload-area"
-        )
+            gr.HTML(
+                """
+                <div class="section-title">
+                    <span style="color:#6366f1;">01</span>
+                    &nbsp; Upload your audio
+                </div>
 
-        audio_info = gr.Markdown(
-            "Select an audio file to continue.",
-            elem_classes="file-info"
-        )
+                <div class="section-description">
+                    Upload a noisy recording or record one directly
+                    using your microphone.
+                </div>
+                """
+            )
+
+            noisy_audio = gr.Audio(
+                label="",
+                type="filepath",
+                sources=["upload", "microphone"],
+                elem_classes="upload-area"
+            )
+
+            audio_info = gr.Markdown(
+                "Select an audio file to continue.",
+                elem_classes="file-info"
+            )
+
+
+        # ----------------------------------------------------
+        # RIGHT CARD — RESULT
+        # ----------------------------------------------------
+
+        with gr.Column(elem_classes="card"):
+
+            gr.HTML(
+                """
+                <div class="section-title">
+                    <span style="color:#6366f1;">03</span>
+                    &nbsp; Your enhanced audio
+                </div>
+
+                <div class="section-description">
+                    Listen to your cleaned recording below.
+                </div>
+                """
+
+            )
+
+            denoised_audio = gr.Audio(
+                label="",
+                type="filepath",
+                interactive=False,
+                elem_id="result-audio"
+            )
+
+            result_info = gr.Markdown(
+                "Your enhanced audio will appear here after processing.",
+                elem_classes="file-info"
+            )
 
 
     # ========================================================
@@ -651,25 +802,7 @@ with gr.Blocks(
     # ========================================================
 
     gr.HTML(
-        "<div style='height:25px'></div>"
-    )
-
-    gr.HTML(
-        """
-        <div style="text-align:center;">
-
-            <div class="section-title">
-                <span style="color:#6366f1;">02</span>
-                &nbsp; Enhance your audio
-            </div>
-
-            <div class="section-description">
-                Let AI reduce unwanted background noise
-                from your recording.
-            </div>
-
-        </div>
-        """
+        "<div style='height:3px'></div>"
     )
 
     denoise_button = gr.Button(
@@ -677,41 +810,6 @@ with gr.Blocks(
         variant="primary",
         elem_classes="denoise-button"
     )
-
-
-    # ========================================================
-    # STEP 3 — RESULT
-    # ========================================================
-
-    gr.HTML(
-        "<div style='height:25px'></div>"
-    )
-
-    with gr.Column(elem_classes="card"):
-
-        gr.HTML(
-            """
-            <div class="section-title">
-                <span style="color:#6366f1;">03</span>
-                &nbsp; Your enhanced audio
-            </div>
-
-            <div class="section-description">
-                Listen to your cleaned recording below.
-            </div>
-            """
-        )
-
-        success_message = gr.HTML(
-            "",
-            visible=False
-        )
-
-        denoised_audio = gr.Audio(
-            label="Denoised Audio",
-            type="filepath",
-            interactive=False
-        )
 
 
     # ========================================================
@@ -745,11 +843,11 @@ with gr.Blocks(
             <div class="info-card">
                 <div class="info-icon">📤</div>
 
-                <h3>Upload</h3>
+                <h3>Record or Upload</h3>
 
                 <p>
-                    Select a noisy audio recording
-                    from your device.
+                    Upload an audio file or record
+                    directly using your microphone.
                 </p>
             </div>
             """
@@ -815,6 +913,13 @@ with gr.Blocks(
         outputs=audio_info
     )
 
+    # Reset the result box whenever a new file is chosen
+    noisy_audio.change(
+        fn=lambda: "Your enhanced audio will appear here after processing.",
+        inputs=None,
+        outputs=result_info
+    )
+
 
     # Denoise
     denoise_button.click(
@@ -822,15 +927,9 @@ with gr.Blocks(
         inputs=noisy_audio,
         outputs=denoised_audio
     ).then(
-        fn=lambda: gr.update(
-            value="""
-            <div class="success-message">
-                ✓ Your audio has been successfully enhanced.
-            </div>
-            """,
-            visible=True
-        ),
-        outputs=success_message
+        fn=get_result_info,
+        inputs=[noisy_audio, denoised_audio],
+        outputs=result_info
     )
 
 
